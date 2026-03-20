@@ -1,0 +1,43 @@
+# Ignore all
+*
+# Unignore all with extensions
+!*.*
+# Unignore all dirs
+!*/
+### Above combination will ignore all files without extension ###
+
+*.onnx
+*.pt
+*.ckpt
+*.zip
+*.gz
+*.tar
+*.exe
+*.prof
+*.pprof
+*.mid
+*.wav
+*.notes
+*.mo
+*.pdf
+*.midi
+*.ly
+cmd/*.mid
+cmd/json.mid
+zenrender
+bin/
+lilypond/
+vendor/
+build/
+go.work
+go.work.sum
+tls-client/
+fhttp/
+utls/
+www/
+models/
+clones/
+temp_analyze/
+research/
+sfizz-repo/
+research/sfizz-repo/

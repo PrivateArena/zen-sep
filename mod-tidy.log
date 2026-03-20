@@ -1,0 +1,16 @@
+go: downloading github.com/mhuisi/stft v0.0.0-20201115161044-6721528c1199
+go: zen-separator/pkg/audio imports
+	github.com/mhuisi/stft: github.com/mhuisi/stft@v0.0.0-20201115161044-6721528c1199: invalid version: git ls-remote -q origin in /home/jang/go/pkg/mod/cache/vcs/9771a88db9233999fade1e97aeae2ffb2511454b8f8c7419863fd1b4c5c49273: exit status 128:
+	remote: Repository not found.
+	fatal: repository 'https://github.com/mhuisi/stft/' not found
+go: zen-separator/pkg/audio imports
+	github.com/youpy/go-wav imports
+	github.com/youpy/go-riff: github.com/mhuisi/stft@v0.0.0-20201115161044-6721528c1199: invalid version: git ls-remote -q origin in /home/jang/go/pkg/mod/cache/vcs/9771a88db9233999fade1e97aeae2ffb2511454b8f8c7419863fd1b4c5c49273: exit status 128:
+	remote: Repository not found.
+	fatal: repository 'https://github.com/mhuisi/stft/' not found
+go: zen-separator/pkg/audio imports
+	github.com/youpy/go-wav tested by
+	github.com/youpy/go-wav.test imports
+	github.com/stretchr/testify/assert: github.com/mhuisi/stft@v0.0.0-20201115161044-6721528c1199: invalid version: git ls-remote -q origin in /home/jang/go/pkg/mod/cache/vcs/9771a88db9233999fade1e97aeae2ffb2511454b8f8c7419863fd1b4c5c49273: exit status 128:
+	remote: Repository not found.
+	fatal: repository 'https://github.com/mhuisi/stft/' not found

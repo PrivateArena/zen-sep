@@ -1,0 +1,6 @@
+pkg/audio/stft.go:4:2: missing go.sum entry for module providing package github.com/mhuisi/stft (imported by zen-separator/pkg/audio); to add:
+	go get zen-separator/pkg/audio
+pkg/audio/wav.go:6:2: missing go.sum entry for module providing package github.com/youpy/go-wav (imported by zen-separator/pkg/audio); to add:
+	go get zen-separator/pkg/audio
+pkg/separator/ort.go:6:2: missing go.sum entry for module providing package github.com/yalue/onnxruntime_go (imported by zen-separator/pkg/separator); to add:
+	go get zen-separator/pkg/separator
