@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"log"
 	"math"
@@ -8,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/pprof"
 	"sync"
 	"sync/atomic"
 
@@ -16,13 +18,35 @@ import (
 )
 
 func main() {
-	if len(os.Args) < 3 {
-		fmt.Printf("Usage: %s <input.wav> <model.onnx>\n", os.Args[0])
+	pprofEnabled := flag.Bool("pprof", false, "Enable CPU profiling")
+	flag.Usage = func() {
+		fmt.Printf("Usage: %s [options] <input.wav> <model.onnx>\n", os.Args[0])
+		flag.PrintDefaults()
+	}
+	flag.Parse()
+
+	args := flag.Args()
+	if len(args) < 2 {
+		flag.Usage()
 		return
 	}
 
-	inputFile := os.Args[1]
-	modelFile := os.Args[2]
+	inputFile := args[0]
+	modelFile := args[1]
+
+	if *pprofEnabled {
+		fmt.Println("🚀 CPU Profiling Enabled...")
+		f, err := os.Create("cpu.prof")
+		if err != nil {
+			log.Fatal("could not create CPU profile: ", err)
+		}
+		defer f.Close()
+		if err := pprof.StartCPUProfile(f); err != nil {
+			log.Fatal("could not start CPU profile: ", err)
+		}
+		defer pprof.StopCPUProfile()
+	}
+
 	libPath := "/media/jang/home/Deve/transcribe-models/onnxruntime-linux-x64-1.24.2/lib/libonnxruntime.so.1.24.2"
 
 	fmt.Printf("Loading model: %s\n", modelFile)
@@ -46,11 +70,11 @@ func main() {
 	chns := int(sep.Shape[1])
 	freqBins := int(sep.Shape[2])
 	chunkSize := int(sep.Shape[3])
-	
+
 	// N_FFT = (dim_f - 1) * 2 or exactly 5120 for many HQ models
 	n_fft := 5120
 	hopSize := n_fft / 4 // 1280
-	
+
 	fmt.Printf("Engine Config: n_fft=%d, hop=%d, channels=%d, chunkSize=%d\n", n_fft, hopSize, chns, chunkSize)
 
 	// Interleaved to de-interleaved
@@ -87,12 +111,12 @@ func main() {
 	}
 
 	fmt.Printf("Processing %d frames (Parallel Workers: %d)...\n", numFrames, runtime.NumCPU())
-	
+
 	// Worker pool for Inference
 	// We limit to 4 parallel inference calls at once because each ORT call is internally multi-threaded
-	sem := make(chan struct{}, 4) 
+	sem := make(chan struct{}, 4)
 	var progress int32
-	
+
 	for startFrame := 0; startFrame < numFrames; startFrame += chunkSize / 2 {
 		wg.Add(1)
 		go func(frame int) {
@@ -110,13 +134,13 @@ func main() {
 				fIdx := frame + t
 				for f := 0; f < freqBins; f++ {
 					if chns == 4 {
-						inputBuf[0*freqBins*chunkSize + f*chunkSize + t] = float32(real(stftLeft[fIdx][f]))
-						inputBuf[1*freqBins*chunkSize + f*chunkSize + t] = float32(imag(stftLeft[fIdx][f]))
-						inputBuf[2*freqBins*chunkSize + f*chunkSize + t] = float32(real(stftRight[fIdx][f]))
-						inputBuf[3*freqBins*chunkSize + f*chunkSize + t] = float32(imag(stftRight[fIdx][f]))
+						inputBuf[0*freqBins*chunkSize+f*chunkSize+t] = float32(real(stftLeft[fIdx][f]))
+						inputBuf[1*freqBins*chunkSize+f*chunkSize+t] = float32(imag(stftLeft[fIdx][f]))
+						inputBuf[2*freqBins*chunkSize+f*chunkSize+t] = float32(real(stftRight[fIdx][f]))
+						inputBuf[3*freqBins*chunkSize+f*chunkSize+t] = float32(imag(stftRight[fIdx][f]))
 					} else {
-						inputBuf[0*freqBins*chunkSize + f*chunkSize + t] = float32(cmplx.Abs(stftLeft[fIdx][f]))
-						inputBuf[1*freqBins*chunkSize + f*chunkSize + t] = float32(cmplx.Abs(stftRight[fIdx][f]))
+						inputBuf[0*freqBins*chunkSize+f*chunkSize+t] = float32(cmplx.Abs(stftLeft[fIdx][f]))
+						inputBuf[1*freqBins*chunkSize+f*chunkSize+t] = float32(cmplx.Abs(stftRight[fIdx][f]))
 					}
 				}
 			}
@@ -131,23 +155,23 @@ func main() {
 				fIdx := frame + t
 				for f := 0; f < freqBins; f++ {
 					if chns == 4 {
-						re_l := outputTensors[0*freqBins*chunkSize + f*chunkSize + t]
-						im_l := outputTensors[1*freqBins*chunkSize + f*chunkSize + t]
-						re_r := outputTensors[2*freqBins*chunkSize + f*chunkSize + t]
-						im_r := outputTensors[3*freqBins*chunkSize + f*chunkSize + t]
+						re_l := outputTensors[0*freqBins*chunkSize+f*chunkSize+t]
+						im_l := outputTensors[1*freqBins*chunkSize+f*chunkSize+t]
+						re_r := outputTensors[2*freqBins*chunkSize+f*chunkSize+t]
+						im_r := outputTensors[3*freqBins*chunkSize+f*chunkSize+t]
 						outputStftLeft[fIdx][f] = complex(float64(re_l), float64(im_l))
 						outputStftRight[fIdx][f] = complex(float64(re_r), float64(im_r))
 					} else {
-						maskL := outputTensors[0*freqBins*chunkSize + f*chunkSize + t]
-						maskR := outputTensors[1*freqBins*chunkSize + f*chunkSize + t]
+						maskL := outputTensors[0*freqBins*chunkSize+f*chunkSize+t]
+						maskR := outputTensors[1*freqBins*chunkSize+f*chunkSize+t]
 						outputStftLeft[fIdx][f] = cmplx.Rect(float64(maskL), cmplx.Phase(stftLeft[fIdx][f]))
 						outputStftRight[fIdx][f] = cmplx.Rect(float64(maskR), cmplx.Phase(stftRight[fIdx][f]))
 					}
 				}
 			}
-			
+
 			newProg := atomic.AddInt32(&progress, int32(chunkSize/2))
-			if frame % 1024 == 0 {
+			if frame%1024 == 0 {
 				fmt.Printf("\rProgress: %.1f%%", float64(newProg)/float64(numFrames)*100)
 			}
 		}(startFrame)
@@ -171,15 +195,19 @@ func main() {
 	fmt.Println("Final Processing: Peak Normalization & Boost...")
 	maxPeak := float32(0.0)
 	for i := range outLeft {
-		if float32(math.Abs(float64(outLeft[i]))) > maxPeak { maxPeak = float32(math.Abs(float64(outLeft[i]))) }
-		if float32(math.Abs(float64(outRight[i]))) > maxPeak { maxPeak = float32(math.Abs(float64(outRight[i]))) }
+		if float32(math.Abs(float64(outLeft[i]))) > maxPeak {
+			maxPeak = float32(math.Abs(float64(outLeft[i])))
+		}
+		if float32(math.Abs(float64(outRight[i]))) > maxPeak {
+			maxPeak = float32(math.Abs(float64(outRight[i])))
+		}
 	}
-	
+
 	gain := float32(1.0)
 	if maxPeak > 1e-10 {
 		gain = 0.99 / maxPeak
 	}
-	
+
 	outInterleaved := make([]float32, numSamples*2)
 	for i := 0; i < numSamples; i++ {
 		outInterleaved[i*2] = outLeft[i] * gain
