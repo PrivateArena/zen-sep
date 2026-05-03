@@ -28,13 +28,18 @@ func LoadWav(path string) ([]float32, int, error) {
 			break
 		}
 		for _, v := range s {
-			for c := 0; c < channels; c++ {
-				samples = append(samples, float32(v.Values[c])/32768.0)
+			if channels == 1 {
+				val := float32(v.Values[0]) / 32768.0
+				samples = append(samples, val, val)
+			} else {
+				for c := 0; c < channels; c++ {
+					samples = append(samples, float32(v.Values[c])/32768.0)
+				}
 			}
 		}
 	}
 
-	return samples, channels, nil
+	return samples, 2, nil
 }
 
 func SaveWav(path string, data []float32, sampleRate int, channels int) error {
