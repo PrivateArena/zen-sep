@@ -2,6 +2,8 @@ package audio
 
 import (
 	"math"
+	"runtime"
+	"sync"
 )
 
 func ApplyHannWindow(data []float64) {
@@ -25,14 +27,27 @@ func GetSTFT(wavData []float32, n_fft int, hopSize int) [][]complex128 {
 	for i := range window { window[i] = 1.0 }
 	ApplyHannWindow(window)
 
-	for i := 0; i < numFrames; i++ {
-		start := i * hopSize
-		frame := make([]complex128, n_fft)
-		for j := 0; j < n_fft; j++ {
-			frame[j] = complex(float64(paddedData[start+j])*window[j], 0)
-		}
-		stftResult[i] = FFT(frame)
+	// Parallelize FFTs
+	numWorkers := runtime.NumCPU()
+	var wg sync.WaitGroup
+	chunk := (numFrames + numWorkers - 1) / numWorkers
+
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func(start, end int) {
+			defer wg.Done()
+			for i := start; i < end && i < numFrames; i++ {
+				startIdx := i * hopSize
+				frame := make([]complex128, n_fft)
+				for j := 0; j < n_fft; j++ {
+					frame[j] = complex(float64(paddedData[startIdx+j])*window[j], 0)
+				}
+				stftResult[i] = FFT(frame)
+			}
+		}(w*chunk, (w+1)*chunk)
 	}
+	wg.Wait()
+	
 	return stftResult
 }
 
@@ -47,10 +62,27 @@ func GetISTFT(spectrogram [][]complex128, n_fft int, hopSize int, length int) []
 	for i := range window { window[i] = 1.0 }
 	ApplyHannWindow(window)
 
+	// Pre-compute IFFTs in parallel to speed up ISTFT
+	iffts := make([][]complex128, numFrames)
+	numWorkers := runtime.NumCPU()
+	var wg sync.WaitGroup
+	chunkSize := (numFrames + numWorkers - 1) / numWorkers
+
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func(start, end int) {
+			defer wg.Done()
+			for i := start; i < end && i < numFrames; i++ {
+				iffts[i] = IFFT(spectrogram[i])
+			}
+		}(w*chunkSize, (w+1)*chunkSize)
+	}
+	wg.Wait()
+
+	// Serial Overlap-Add to avoid atomic contention or logic errors
 	for i := 0; i < numFrames; i++ {
 		start := i * hopSize
-		// ISTFT: IFFT(frame) * window
-		frame := IFFT(spectrogram[i])
+		frame := iffts[i]
 		for j := 0; j < n_fft; j++ {
 			if start+j < outputLength {
 				output[start+j] += real(frame[j]) * window[j]

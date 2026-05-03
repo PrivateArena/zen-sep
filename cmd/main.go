@@ -192,27 +192,52 @@ func main() {
 	wg.Wait()
 
 	// Final Mastering
-	fmt.Println("Final Processing: Peak Normalization & Boost...")
-	maxPeak := float32(0.0)
-	for i := range outLeft {
-		if float32(math.Abs(float64(outLeft[i]))) > maxPeak {
-			maxPeak = float32(math.Abs(float64(outLeft[i])))
-		}
-		if float32(math.Abs(float64(outRight[i]))) > maxPeak {
-			maxPeak = float32(math.Abs(float64(outRight[i])))
-		}
+	fmt.Println("Final Processing: Peak Normalization & Boost (Parallel)...")
+	
+	numWorkers := runtime.NumCPU()
+	chunkSizeMaster := (numSamples + numWorkers - 1) / numWorkers
+	
+	// Phase 1: Parallel Peak Detection
+	peaks := make([]float32, numWorkers)
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func(id, start, end int) {
+			defer wg.Done()
+			currMax := float32(0.0)
+			for i := start; i < end && i < numSamples; i++ {
+				absL := float32(math.Abs(float64(outLeft[i])))
+				absR := float32(math.Abs(float64(outRight[i])))
+				if absL > currMax { currMax = absL }
+				if absR > currMax { currMax = absR }
+			}
+			peaks[id] = currMax
+		}(w, w*chunkSizeMaster, (w+1)*chunkSizeMaster)
 	}
+	wg.Wait()
 
+	maxPeak := float32(0.0)
+	for _, p := range peaks {
+		if p > maxPeak { maxPeak = p }
+	}
+	
 	gain := float32(1.0)
 	if maxPeak > 1e-10 {
 		gain = 0.99 / maxPeak
 	}
-
+	
+	// Phase 2: Parallel Interleaving & Gain Application
 	outInterleaved := make([]float32, numSamples*2)
-	for i := 0; i < numSamples; i++ {
-		outInterleaved[i*2] = outLeft[i] * gain
-		outInterleaved[i*2+1] = outRight[i] * gain
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func(start, end int) {
+			defer wg.Done()
+			for i := start; i < end && i < numSamples; i++ {
+				outInterleaved[i*2] = outLeft[i] * gain
+				outInterleaved[i*2+1] = outRight[i] * gain
+			}
+		}(w*chunkSizeMaster, (w+1)*chunkSizeMaster)
 	}
+	wg.Wait()
 
 	outputFile := filepath.Join(filepath.Dir(inputFile), "separated_"+filepath.Base(inputFile))
 	_ = audio.SaveWav(outputFile, outInterleaved, 44100, 2)
