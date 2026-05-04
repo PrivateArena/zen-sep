@@ -20,7 +20,7 @@ import (
 
 func main() {
 	pprofEnabled := flag.Bool("pprof", false, "Enable CPU profiling")
-	modelType := flag.String("type", "mdxnet", "Model type: mdxnet or demucs")
+	modelType := flag.String("type", "mdxnet", "Model type: mdxnet, demucs, or spleeter")
 	flag.Usage = func() {
 		fmt.Printf("Usage: %s [options] <input.wav> <model.onnx>\n", os.Args[0])
 		flag.PrintDefaults()
@@ -68,6 +68,15 @@ func main() {
 			ChunkSize:  343980,
 			Stems:      []string{"drums", "bass", "other", "vocals"},
 		}
+	} else if *modelType == "spleeter" {
+		config = separator.Config{
+			Type:       separator.ModelTypeSpleeter,
+			SampleRate: 44100,
+			N_FFT:      4096,
+			HopSize:    1024,
+			ChunkSize:  1024, // Frames
+			Stems:      []string{"vocals"},
+		}
 	}
 
 	fmt.Printf("Loading model (%s): %s\n", config.Type, modelFile)
@@ -91,6 +100,8 @@ func main() {
 		processMDXNet(sep, data, inputFile)
 	} else if config.Type == separator.ModelTypeDemucs {
 		processDemucs(sep, data, inputFile)
+	} else if config.Type == separator.ModelTypeSpleeter {
+		processSpleeter(sep, data, inputFile)
 	}
 }
 
@@ -303,6 +314,106 @@ func processDemucs(sep *separator.Separator, data []float32, inputFile string) {
 		}
 		saveStereoFull(out, inputFile, stemName)
 	}
+}
+
+func processSpleeter(sep *separator.Separator, data []float32, inputFile string) {
+	n_fft := 4096
+	hopSize := 1024
+	numSamples := len(data) / 2
+
+	// De-interleave
+	left := make([]float32, numSamples)
+	right := make([]float32, numSamples)
+	for i := 0; i < numSamples; i++ {
+		left[i] = data[i*2]
+		right[i] = data[i*2+1]
+	}
+
+	fmt.Println("Getting STFT (Parallel)...")
+	var stftL, stftR [][]complex128
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		stftL = audio.GetSTFT(left, n_fft, hopSize)
+	}()
+	go func() {
+		defer wg.Done()
+		stftR = audio.GetSTFT(right, n_fft, hopSize)
+	}()
+	wg.Wait()
+
+	numFrames := len(stftL)
+	// Spleeter (Sherpa-ONNX) expects [2, T, 512, 1024]
+	// T is num_splits, 512 is freq bins (first 511 + 1?), 1024 is frames per split?
+	// Actually, let's look at the shape again: [2, num_splits, 512, 1024]
+	// If 1024 is frames per split, and num_splits = numFrames / 1024.
+	// 512 is likely the first 512 bins of the 2049 bins (from 4096 FFT).
+	
+	splitSize := 1024
+	numSplits := (numFrames + splitSize - 1) / splitSize
+	freqBins := 512
+
+	inputX := make([]float32, 2*numSplits*freqBins*splitSize)
+	for split := 0; split < numSplits; split++ {
+		for t := 0; t < splitSize; t++ {
+			fIdx := split*splitSize + t
+			if fIdx >= numFrames { break }
+			for f := 0; f < freqBins; f++ {
+				// Spleeter models typically use magnitude STFT
+				inputX[0*numSplits*freqBins*splitSize + split*freqBins*splitSize + f*splitSize + t] = float32(cmplx.Abs(stftL[fIdx][f]))
+				inputX[1*numSplits*freqBins*splitSize + split*freqBins*splitSize + f*splitSize + t] = float32(cmplx.Abs(stftR[fIdx][f]))
+			}
+		}
+	}
+
+	inputShape := ort.NewShape(2, int64(numSplits), int64(freqBins), int64(splitSize))
+	inputTensor, _ := ort.NewTensor(inputShape, inputX)
+	defer inputTensor.Destroy()
+
+	outputTensors := make([]*ort.Tensor[float32], len(sep.Outputs))
+	for i := range sep.Outputs {
+		// Output shape [2, num_splits, 512, 1024]
+		outShape := ort.NewShape(2, int64(numSplits), int64(freqBins), int64(splitSize))
+		outputTensors[i], _ = ort.NewEmptyTensor[float32](outShape)
+		defer outputTensors[i].Destroy()
+	}
+
+	fmt.Println("Running Spleeter Inference...")
+	err := sep.RunInference([]*ort.Tensor[float32]{inputTensor}, outputTensors)
+	if err != nil {
+		log.Fatalf("Spleeter inference failed: %v", err)
+	}
+
+	outData := outputTensors[0].GetData()
+	outputStftL := make([][]complex128, numFrames)
+	outputStftR := make([][]complex128, numFrames)
+	for i := range outputStftL {
+		outputStftL[i] = make([]complex128, n_fft/2+1)
+		outputStftR[i] = make([]complex128, n_fft/2+1)
+	}
+
+	for split := 0; split < numSplits; split++ {
+		for t := 0; t < splitSize; t++ {
+			fIdx := split*splitSize + t
+			if fIdx >= numFrames { break }
+			for f := 0; f < freqBins; f++ {
+				maskL := outData[0*numSplits*freqBins*splitSize + split*freqBins*splitSize + f*splitSize + t]
+				maskR := outData[1*numSplits*freqBins*splitSize + split*freqBins*splitSize + f*splitSize + t]
+				
+				// Apply mask to original complex STFT
+				outputStftL[fIdx][f] = cmplx.Rect(float64(maskL), cmplx.Phase(stftL[fIdx][f]))
+				outputStftR[fIdx][f] = cmplx.Rect(float64(maskR), cmplx.Phase(stftR[fIdx][f]))
+			}
+			// Bins beyond 512 are zeroed out (standard Spleeter behavior for 11kHz cutoff)
+		}
+	}
+
+	fmt.Println("Reconstructing Spleeter audio...")
+	outLeft := audio.GetISTFT(outputStftL, n_fft, hopSize, numSamples)
+	outRight := audio.GetISTFT(outputStftR, n_fft, hopSize, numSamples)
+
+	saveStereo(outLeft, outRight, inputFile, "vocals")
 }
 
 func saveStereoFull(data []float32, originalPath, suffix string) {

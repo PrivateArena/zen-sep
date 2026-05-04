@@ -11,6 +11,7 @@ type ModelType string
 const (
 	ModelTypeMDXNet ModelType = "mdxnet"
 	ModelTypeDemucs ModelType = "demucs"
+	ModelTypeSpleeter ModelType = "spleeter"
 )
 
 type Config struct {
