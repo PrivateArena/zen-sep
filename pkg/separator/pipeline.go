@@ -9,7 +9,8 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"zen-separator/pkg/audio"
+	"zen-sep/pkg/audio"
+
 	"github.com/schollz/progressbar/v3"
 	ort "github.com/yalue/onnxruntime_go"
 )

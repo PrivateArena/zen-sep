@@ -1,4 +1,4 @@
-module zen-separator
+module zen-sep
 
 go 1.23.3
 

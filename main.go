@@ -7,8 +7,8 @@ import (
 	"os"
 	"runtime/pprof"
 
-	"zen-separator/pkg/audio"
-	"zen-separator/pkg/separator"
+	"zen-sep/pkg/audio"
+	"zen-sep/pkg/separator"
 )
 
 func main() {
