@@ -6,12 +6,48 @@ import (
 	"sync"
 )
 
+// hannCache stores precomputed Hann windows keyed by length.
+// Fix #6: avoids recomputing O(n_fft) math.Cos calls on every STFT/ISTFT call.
+var hannCache sync.Map // map[int][]float64
+
+func getHannWindow(n int) []float64 {
+	if v, ok := hannCache.Load(n); ok {
+		return v.([]float64)
+	}
+	w := make([]float64, n)
+	for i := 0; i < n; i++ {
+		w[i] = 0.5 * (1 - math.Cos(2*math.Pi*float64(i)/float64(n)))
+	}
+	hannCache.Store(n, w)
+	return w
+}
+
+// ApplyHannWindow multiplies data in-place by a periodic Hann window.
+// Kept for compatibility; internal callers use getHannWindow.
 func ApplyHannWindow(data []float64) {
 	n := len(data)
-	// periodic=True Hann window matches torch.hann_window
-	for i := 0; i < n; i++ {
-		data[i] *= 0.5 * (1 - math.Cos(2*math.Pi*float64(i)/float64(n)))
+	w := getHannWindow(n)
+	for i := range data {
+		data[i] *= w[i]
 	}
+}
+
+// framePools maps n_fft → *sync.Pool of []complex128 scratch buffers.
+// Fix #5: eliminates per-frame heap allocation inside parallel goroutines.
+var framePools sync.Map // map[int]*sync.Pool
+
+func getFramePool(n int) *sync.Pool {
+	if v, ok := framePools.Load(n); ok {
+		return v.(*sync.Pool)
+	}
+	p := &sync.Pool{
+		New: func() any {
+			buf := make([]complex128, n)
+			return &buf
+		},
+	}
+	framePools.Store(n, p)
+	return p
 }
 
 func GetSTFT(wavData []float32, n_fft int, hopSize int) [][]complex128 {
@@ -20,14 +56,12 @@ func GetSTFT(wavData []float32, n_fft int, hopSize int) [][]complex128 {
 	paddedData := make([]float32, len(wavData)+2*pad)
 	copy(paddedData[pad:], wavData)
 
-	numFrames := (len(paddedData) - n_fft) / hopSize + 1
+	numFrames := (len(paddedData)-n_fft)/hopSize + 1
 	stftResult := make([][]complex128, numFrames)
-	
-	window := make([]float64, n_fft)
-	for i := range window { window[i] = 1.0 }
-	ApplyHannWindow(window)
 
-	// Parallelize FFTs
+	window := getHannWindow(n_fft) // cached — no alloc after first call
+	pool := getFramePool(n_fft)
+
 	numWorkers := runtime.NumCPU()
 	var wg sync.WaitGroup
 	chunk := (numFrames + numWorkers - 1) / numWorkers
@@ -38,31 +72,35 @@ func GetSTFT(wavData []float32, n_fft int, hopSize int) [][]complex128 {
 			defer wg.Done()
 			for i := start; i < end && i < numFrames; i++ {
 				startIdx := i * hopSize
-				frame := make([]complex128, n_fft)
+
+				// Borrow scratch buffer from pool (Fix #5)
+				framep := pool.Get().(*[]complex128)
+				frame := *framep
 				for j := 0; j < n_fft; j++ {
 					frame[j] = complex(float64(paddedData[startIdx+j])*window[j], 0)
 				}
-				stftResult[i] = FFT(frame)
+				out := FFT(frame)
+				// FFT returns a new slice; return scratch to pool
+				pool.Put(framep)
+				stftResult[i] = out
 			}
 		}(w*chunk, (w+1)*chunk)
 	}
 	wg.Wait()
-	
+
 	return stftResult
 }
 
 func GetISTFT(spectrogram [][]complex128, n_fft int, hopSize int, length int) []float32 {
 	numFrames := len(spectrogram)
 	outputLength := (numFrames-1)*hopSize + n_fft
-	
+
 	output := make([]float64, outputLength)
 	overlap := make([]float64, outputLength)
-	
-	window := make([]float64, n_fft)
-	for i := range window { window[i] = 1.0 }
-	ApplyHannWindow(window)
 
-	// Pre-compute IFFTs in parallel to speed up ISTFT
+	window := getHannWindow(n_fft) // cached
+
+	// Pre-compute IFFTs in parallel
 	iffts := make([][]complex128, numFrames)
 	numWorkers := runtime.NumCPU()
 	var wg sync.WaitGroup
@@ -79,7 +117,7 @@ func GetISTFT(spectrogram [][]complex128, n_fft int, hopSize int, length int) []
 	}
 	wg.Wait()
 
-	// Serial Overlap-Add to avoid atomic contention or logic errors
+	// Serial Overlap-Add
 	for i := 0; i < numFrames; i++ {
 		start := i * hopSize
 		frame := iffts[i]
@@ -90,7 +128,7 @@ func GetISTFT(spectrogram [][]complex128, n_fft int, hopSize int, length int) []
 			}
 		}
 	}
-	
+
 	// Normalize by overlap-add energy
 	res := make([]float32, length)
 	pad := n_fft / 2

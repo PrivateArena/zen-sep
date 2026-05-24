@@ -2,6 +2,8 @@ package separator
 
 import (
 	"fmt"
+	"runtime"
+
 	ort "github.com/yalue/onnxruntime_go"
 )
 
@@ -9,24 +11,25 @@ import (
 type ModelType string
 
 const (
-	ModelTypeMDXNet ModelType = "mdxnet"
-	ModelTypeDemucs ModelType = "demucs"
+	ModelTypeMDXNet   ModelType = "mdxnet"
+	ModelTypeDemucs   ModelType = "demucs"
 	ModelTypeSpleeter ModelType = "spleeter"
 )
 
 type Config struct {
-	Type         ModelType `json:"type"`
-	SampleRate   int       `json:"sample_rate"`
-	HopSize      int       `json:"hop_size"`
-	N_FFT        int       `json:"n_fft"`
-	ChunkSize    int       `json:"chunk_size"`
-	FreqBins     int       `json:"freq_bins"`
-	Overlap      float32   `json:"overlap"`
-	Stems        []string  `json:"stems"`
+	Type       ModelType `json:"type"`
+	SampleRate int       `json:"sample_rate"`
+	HopSize    int       `json:"hop_size"`
+	N_FFT      int       `json:"n_fft"`
+	ChunkSize  int       `json:"chunk_size"`
+	FreqBins   int       `json:"freq_bins"`
+	Overlap    float32   `json:"overlap"`
+	Stems      []string  `json:"stems"`
 }
 
 type Separator struct {
-	Session *ort.DynamicSession[float32, float32]
+	// Fix #3: use DynamicAdvancedSession so SessionOptions are actually applied.
+	Session *ort.DynamicAdvancedSession
 	Config  Config
 	Inputs  []ort.InputOutputInfo
 	Outputs []ort.InputOutputInfo
@@ -44,8 +47,16 @@ func NewSeparator(modelPath string, libPath string, config Config) (*Separator, 
 	if err != nil {
 		return nil, fmt.Errorf("failed to create session options: %w", err)
 	}
-	_ = opts.SetIntraOpNumThreads(4)
-	_ = opts.SetInterOpNumThreads(4)
+
+	// Use all logical CPUs for intra-op parallelism (matrix math inside a single op).
+	// Cap at 8 to avoid scheduler overhead on very wide CPUs.
+	numThreads := runtime.NumCPU()
+	if numThreads > 8 {
+		numThreads = 8
+	}
+	_ = opts.SetIntraOpNumThreads(numThreads)
+	// Inter-op parallelism: 1 is usually best unless the model has independent branches.
+	_ = opts.SetInterOpNumThreads(1)
 
 	inputs, outputs, err := ort.GetInputOutputInfo(modelPath)
 	if err != nil {
@@ -61,7 +72,9 @@ func NewSeparator(modelPath string, libPath string, config Config) (*Separator, 
 		outputNames[i] = out.Name
 	}
 
-	session, err := ort.NewDynamicSession[float32, float32](modelPath, inputNames, outputNames)
+	// Fix #3: NewDynamicAdvancedSession forwards opts to the C OrtSession,
+	// so thread-count settings are actually applied during inference.
+	session, err := ort.NewDynamicAdvancedSession(modelPath, inputNames, outputNames, opts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create session: %w", err)
 	}
@@ -75,6 +88,8 @@ func NewSeparator(modelPath string, libPath string, config Config) (*Separator, 
 	}, nil
 }
 
-func (s *Separator) RunInference(inputs []*ort.Tensor[float32], outputs []*ort.Tensor[float32]) error {
+// RunInference runs the ONNX model. Accepts and returns ort.Value slices so
+// callers can pass *Tensor[float32] directly (it implements ort.Value).
+func (s *Separator) RunInference(inputs []ort.Value, outputs []ort.Value) error {
 	return s.Session.Run(inputs, outputs)
 }

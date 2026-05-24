@@ -138,8 +138,9 @@ func processMDXNet(sep *separator.Separator, data []float32, inputFile string) {
 	outputStftLeft := make([][]complex128, numFrames)
 	outputStftRight := make([][]complex128, numFrames)
 	for i := range outputStftLeft {
-		outputStftLeft[i] = make([]complex128, n_fft)
-		outputStftRight[i] = make([]complex128, n_fft)
+		// Fix #7: allocate freqBins, not n_fft (was 2x too large)
+		outputStftLeft[i] = make([]complex128, freqBins)
+		outputStftRight[i] = make([]complex128, freqBins)
 	}
 
 	sem := make(chan struct{}, 4)
@@ -174,7 +175,10 @@ func processMDXNet(sep *separator.Separator, data []float32, inputFile string) {
 			outputTensor, _ := ort.NewEmptyTensor[float32](inputShape)
 			defer outputTensor.Destroy()
 
-			err := sep.RunInference([]*ort.Tensor[float32]{inputTensor}, []*ort.Tensor[float32]{outputTensor})
+			err := sep.RunInference(
+				[]ort.Value{inputTensor},
+				[]ort.Value{outputTensor},
+			)
 			if err != nil {
 				log.Printf("Inference failed: %v", err)
 				return
@@ -208,9 +212,22 @@ func processDemucs(sep *separator.Separator, data []float32, inputFile string) {
 	numStems := len(sep.Config.Stems)
 
 	// htdemucs_ort_v1 needs "input" [1, 2, 343980] and "x" [1, 4, 2048, 336]
-	// "x" is the STFT of the input. 
+	// "x" is the STFT of the input.
 	demucs_n_fft := 4096
 	demucs_hop := 1024
+
+	// Fix #2: De-interleave full track once and compute STFT before the loop.
+	// Previously GetSTFT was called inside the sliding-window loop, causing
+	// 4× redundant computation due to 75% overlap between consecutive chunks.
+	leftFull := make([]float32, numSamples)
+	rightFull := make([]float32, numSamples)
+	for i := 0; i < numSamples; i++ {
+		leftFull[i] = data[i*2]
+		rightFull[i] = data[i*2+1]
+	}
+	fmt.Println("Getting STFT (Demucs, full track)...")
+	stftFullL := audio.GetSTFT(leftFull, demucs_n_fft, demucs_hop)
+	stftFullR := audio.GetSTFT(rightFull, demucs_n_fft, demucs_hop)
 
 	// Sliding window with 25% overlap
 	stepSize := chunkSize * 3 / 4
@@ -223,60 +240,68 @@ func processDemucs(sep *separator.Separator, data []float32, inputFile string) {
 		stemOutputs[i] = make([]float32, numSamples*2)
 	}
 
+	xFreqBins := 2048
+	xFrames := 336
+
 	bar := progressbar.Default(int64(numChunks), "Separating (Demucs)")
 
 	for start := 0; start < numSamples; start += stepSize {
 		// Prepare waveform input
 		inputWav := make([]float32, 2*chunkSize)
-		left := make([]float32, chunkSize)
-		right := make([]float32, chunkSize)
 		for i := 0; i < chunkSize; i++ {
 			idx := start + i
 			if idx < numSamples {
 				inputWav[i] = data[idx*2]
 				inputWav[chunkSize+i] = data[idx*2+1]
-				left[i] = data[idx*2]
-				right[i] = data[idx*2+1]
 			}
 		}
 
 		inputWavShape := ort.NewShape(1, 2, int64(chunkSize))
 		inputWavTensor, _ := ort.NewTensor(inputWavShape, inputWav)
-		defer inputWavTensor.Destroy()
 
-		// Prepare 'x' (STFT) input: [1, 4, 2048, 336]
-		xFreqBins := 2048
-		xFrames := 336
+		// Fix #2: slice the precomputed full-track STFT for this chunk's frame range.
 		inputX := make([]float32, 4*xFreqBins*xFrames)
-		
-		stftL := audio.GetSTFT(left, demucs_n_fft, demucs_hop)
-		stftR := audio.GetSTFT(right, demucs_n_fft, demucs_hop)
-
-		for t := 0; t < xFrames && t < len(stftL); t++ {
+		frameStart := start / demucs_hop
+		for t := 0; t < xFrames; t++ {
+			fIdx := frameStart + t
+			if fIdx >= len(stftFullL) {
+				break
+			}
 			for f := 0; f < xFreqBins; f++ {
-				inputX[0*xFreqBins*xFrames+f*xFrames+t] = float32(real(stftL[t][f]))
-				inputX[1*xFreqBins*xFrames+f*xFrames+t] = float32(imag(stftL[t][f]))
-				inputX[2*xFreqBins*xFrames+f*xFrames+t] = float32(real(stftR[t][f]))
-				inputX[3*xFreqBins*xFrames+f*xFrames+t] = float32(imag(stftR[t][f]))
+				inputX[0*xFreqBins*xFrames+f*xFrames+t] = float32(real(stftFullL[fIdx][f]))
+				inputX[1*xFreqBins*xFrames+f*xFrames+t] = float32(imag(stftFullL[fIdx][f]))
+				inputX[2*xFreqBins*xFrames+f*xFrames+t] = float32(real(stftFullR[fIdx][f]))
+				inputX[3*xFreqBins*xFrames+f*xFrames+t] = float32(imag(stftFullR[fIdx][f]))
 			}
 		}
 
 		inputXShape := ort.NewShape(1, 4, int64(xFreqBins), int64(xFrames))
 		inputXTensor, _ := ort.NewTensor(inputXShape, inputX)
-		defer inputXTensor.Destroy()
 
 		// htdemucs_ort might have 2 outputs: [1, 4, 2, 343980] and some other metadata
-		// We prepare all outputs based on sep.Outputs info
 		outputTensors := make([]*ort.Tensor[float32], len(sep.Outputs))
 		for i, out := range sep.Outputs {
 			outShape := ort.NewShape(out.Dimensions...)
 			outputTensors[i], _ = ort.NewEmptyTensor[float32](outShape)
-			defer outputTensors[i].Destroy()
 		}
 
-		err := sep.RunInference([]*ort.Tensor[float32]{inputWavTensor, inputXTensor}, outputTensors)
+		inputVals := []ort.Value{inputWavTensor, inputXTensor}
+		outputVals := make([]ort.Value, len(outputTensors))
+		for i, t := range outputTensors {
+			outputVals[i] = t
+		}
+		err := sep.RunInference(inputVals, outputVals)
+
+		// Fix #4: explicit Destroy at end of loop body instead of defer.
+		inputWavTensor.Destroy()
+		inputXTensor.Destroy()
+
 		if err != nil {
 			log.Printf("Inference error at %d: %v", start, err)
+			for _, t := range outputTensors {
+				t.Destroy()
+			}
+			bar.Add(1)
 			continue
 		}
 
@@ -284,22 +309,33 @@ func processDemucs(sep *separator.Separator, data []float32, inputFile string) {
 		outData := outputTensors[0].GetData()
 		for i := 0; i < chunkSize; i++ {
 			idx := start + i
-			if idx >= numSamples { break }
-			
+			if idx >= numSamples {
+				break
+			}
+
 			// Triangular weight
 			distEdge := float32(i)
-			if float32(chunkSize-i) < distEdge { distEdge = float32(chunkSize - i) }
+			if float32(chunkSize-i) < distEdge {
+				distEdge = float32(chunkSize - i)
+			}
 			w := distEdge / float32(chunkSize/8)
-			if w > 1.0 { w = 1.0 }
-			if w < 1e-4 { w = 1e-4 }
-			
+			if w > 1.0 {
+				w = 1.0
+			}
+			if w < 1e-4 {
+				w = 1e-4
+			}
+
 			for s := 0; s < numStems; s++ {
-				lVal := outData[s*2*chunkSize + 0*chunkSize + i]
-				rVal := outData[s*2*chunkSize + 1*chunkSize + i]
+				lVal := outData[s*2*chunkSize+0*chunkSize+i]
+				rVal := outData[s*2*chunkSize+1*chunkSize+i]
 				stemOutputs[s][idx*2] += lVal * w
 				stemOutputs[s][idx*2+1] += rVal * w
 			}
 			stemWeights[idx] += w
+		}
+		for _, t := range outputTensors {
+			t.Destroy()
 		}
 		bar.Add(1)
 	}
@@ -380,7 +416,12 @@ func processSpleeter(sep *separator.Separator, data []float32, inputFile string)
 	}
 
 	fmt.Println("Running Spleeter Inference...")
-	err := sep.RunInference([]*ort.Tensor[float32]{inputTensor}, outputTensors)
+	inputVals := []ort.Value{inputTensor}
+	outputVals := make([]ort.Value, len(outputTensors))
+	for i, t := range outputTensors {
+		outputVals[i] = t
+	}
+	err := sep.RunInference(inputVals, outputVals)
 	if err != nil {
 		log.Fatalf("Spleeter inference failed: %v", err)
 	}
