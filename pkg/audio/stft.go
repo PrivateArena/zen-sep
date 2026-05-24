@@ -2,6 +2,7 @@ package audio
 
 import (
 	"math"
+	"math/cmplx"
 	"runtime"
 	"sync"
 )
@@ -111,7 +112,16 @@ func GetISTFT(spectrogram [][]complex128, n_fft int, hopSize int, length int) []
 		go func(start, end int) {
 			defer wg.Done()
 			for i := start; i < end && i < numFrames; i++ {
-				iffts[i] = IFFT(spectrogram[i])
+				spec := spectrogram[i]
+				if len(spec) == n_fft/2+1 {
+					fullSpec := make([]complex128, n_fft)
+					copy(fullSpec, spec)
+					for k := 1; k < n_fft/2; k++ {
+						fullSpec[n_fft-k] = cmplx.Conj(spec[k])
+					}
+					spec = fullSpec
+				}
+				iffts[i] = IFFT(spec)
 			}
 		}(w*chunkSize, (w+1)*chunkSize)
 	}
