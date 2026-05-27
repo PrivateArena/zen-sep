@@ -17,14 +17,21 @@ const (
 )
 
 type Config struct {
-	Type       ModelType `json:"type"`
-	SampleRate int       `json:"sample_rate"`
-	HopSize    int       `json:"hop_size"`
-	N_FFT      int       `json:"n_fft"`
-	ChunkSize  int       `json:"chunk_size"`
-	FreqBins   int       `json:"freq_bins"`
-	Overlap    float32   `json:"overlap"`
-	Stems      []string  `json:"stems"`
+	Type           ModelType `json:"type" yaml:"type"`
+	SampleRate     int       `json:"sample_rate" yaml:"sample_rate"`
+	HopSize        int       `json:"hop_size" yaml:"hop_size"`
+	N_FFT          int       `json:"n_fft" yaml:"n_fft"`
+	ChunkSize      int       `json:"chunk_size" yaml:"chunk_size"`
+	FreqBins       int       `json:"freq_bins" yaml:"freq_bins"`
+	Overlap        float32   `json:"overlap" yaml:"overlap"`
+	Stems          []string  `json:"stems" yaml:"stems"`
+	IntraOpThreads int       `json:"intra_op_threads" yaml:"intra_op_threads"`
+	OutputDir      string    `json:"output_dir" yaml:"output_dir"`
+	Device         string    `json:"device" yaml:"device"`
+	TargetLUFS     float64   `json:"target_lufs" yaml:"target_lufs"`
+	Residual       bool      `json:"residual" yaml:"residual"`
+	Also16k        bool      `json:"also_16k" yaml:"also_16k"`
+	VADModel       string    `json:"vad_model" yaml:"vad_model"`
 }
 
 type Separator struct {
@@ -33,7 +40,6 @@ type Separator struct {
 	Config  Config
 	Inputs  []ort.InputOutputInfo
 	Outputs []ort.InputOutputInfo
-	Opts    *ort.SessionOptions
 }
 
 func NewSeparator(modelPath string, libPath string, config Config) (*Separator, error) {
@@ -47,16 +53,27 @@ func NewSeparator(modelPath string, libPath string, config Config) (*Separator, 
 	if err != nil {
 		return nil, fmt.Errorf("failed to create session options: %w", err)
 	}
+	defer opts.Destroy() // Ensure options are cleaned up after session initialization
 
-	// Use all logical CPUs for intra-op parallelism (matrix math inside a single op).
-	// Cap at 8 to avoid scheduler overhead on very wide CPUs.
-	numThreads := runtime.NumCPU()
-	if numThreads > 8 {
-		numThreads = 8
+	// Configure intra-op threads
+	numThreads := config.IntraOpThreads
+	if numThreads == 0 {
+		numThreads = runtime.NumCPU()
+		if numThreads > 8 {
+			numThreads = 8
+		}
 	}
 	_ = opts.SetIntraOpNumThreads(numThreads)
-	// Inter-op parallelism: 1 is usually best unless the model has independent branches.
 	_ = opts.SetInterOpNumThreads(1)
+
+	// Append CUDA execution provider if requested
+	if config.Device == "cuda" {
+		cudaOpts, err := ort.NewCUDAProviderOptions()
+		if err == nil {
+			_ = opts.AppendExecutionProviderCUDA(cudaOpts)
+			_ = cudaOpts.Destroy()
+		}
+	}
 
 	inputs, outputs, err := ort.GetInputOutputInfo(modelPath)
 	if err != nil {
@@ -84,7 +101,6 @@ func NewSeparator(modelPath string, libPath string, config Config) (*Separator, 
 		Config:  config,
 		Inputs:  inputs,
 		Outputs: outputs,
-		Opts:    opts,
 	}, nil
 }
 

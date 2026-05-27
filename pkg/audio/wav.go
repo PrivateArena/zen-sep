@@ -5,41 +5,41 @@ import (
 	"github.com/youpy/go-wav"
 )
 
-func LoadWav(path string) ([]float32, int, error) {
+func LoadWav(path string) ([]float32, int, int, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
 	defer f.Close()
 
 	d := wav.NewReader(f)
 	format, err := d.Format()
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
 
 	channels := int(format.NumChannels)
+	sampleRate := int(format.SampleRate)
 	// Pre-allocate a reasonable buffer to reduce re-allocations
 	samples := make([]float32, 0, 1024*1024) 
 	
 	for {
-		s, err := d.ReadSamples()
+		// Read in batches of 4096 to speed up performance dramatically
+		s, err := d.ReadSamples(4096)
 		if err != nil {
 			break
 		}
+		if len(s) == 0 {
+			break
+		}
 		for _, v := range s {
-			if channels == 1 {
-				val := float32(v.Values[0]) / 32768.0
-				samples = append(samples, val, val)
-			} else {
-				for c := 0; c < channels; c++ {
-					samples = append(samples, float32(v.Values[c])/32768.0)
-				}
+			for c := 0; c < channels; c++ {
+				samples = append(samples, float32(v.Values[c])/32768.0)
 			}
 		}
 	}
 
-	return samples, 2, nil
+	return samples, channels, sampleRate, nil
 }
 
 func SaveWav(path string, data []float32, sampleRate int, channels int) error {
